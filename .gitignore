@@ -1,0 +1,11 @@
+# Ralph++ runtime artifacts
+ralph++/
+logs/
+*.prd.json.failed
+
+# Old state/branch files at root (pre-refactor)
+.ralph-state-*.json
+.last-branch
+
+# Claude Code local settings
+.claude/settings.local.json
