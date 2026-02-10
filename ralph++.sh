@@ -1,7 +1,7 @@
 #!/bin/bash
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  Ralph Wiggum — Resilient Claude Code Task Runner               ║
-# ║  Usage: ./ralph.sh [--prd prd.json] [--resume] [--dry-run]     ║
+# ║  Ralph++ — Resilient AI Task Runner                        ║
+# ║  Usage: ./ralph++.sh [--prd prd.json] [--resume] [--dry-run]   ║
 # ╚══════════════════════════════════════════════════════════════════╝
 #
 # Reads your existing prd.json format natively:
@@ -9,13 +9,13 @@
 #     acceptanceCriteria, priority, passes, notes}] }
 #
 # Features:
-#   • Per-task retries with Claude-generated error diagnosis
+#   • Per-task retries with AI-generated error diagnosis
 #   • Accumulated error history injected into retries
 #   • Structured JSON state file — crash-safe, resumable
 #   • Updates prd.json passes/notes fields in place
 #   • Dark-mode terminal UI with progress tracking
 #
-# Requirements: bash 4+, jq, claude CLI
+# Requirements: bash 4+, jq, claude CLI or gemini CLI
 
 set -euo pipefail
 
@@ -63,9 +63,11 @@ DIAG_LEARN=false
 MAX_RETRIES="${RALPH_MAX_RETRIES:-10}"
 TIMEOUT_SEC="${RALPH_TIMEOUT:-600}"
 MAX_TURNS="${RALPH_MAX_TURNS:-50}"
+ENGINE="${RALPH_ENGINE:-claude}"
 _CLI_RETRIES=""
 _CLI_TIMEOUT=""
 _CLI_TURNS=""
+_CLI_ENGINE=""
 
 # ── Parse arguments ───────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -77,11 +79,13 @@ while [[ $# -gt 0 ]]; do
     --retries)   MAX_RETRIES="$2"; _CLI_RETRIES=1; shift 2 ;;
     --timeout)   TIMEOUT_SEC="$2"; _CLI_TIMEOUT=1; shift 2 ;;
     --max-turns) MAX_TURNS="$2"; _CLI_TURNS=1; shift 2 ;;
+    --engine)    ENGINE="$2"; _CLI_ENGINE=1; shift 2 ;;
+    --engine=*)  ENGINE="${1#*=}"; _CLI_ENGINE=1; shift ;;
     --cost)         SHOW_COST=true; shift ;;
     --diag-learn) DIAG_LEARN=true; shift ;;
     -h|--help)
       echo ""
-      echo "Ralph Wiggum — Resilient Claude Code Task Runner"
+      echo "Ralph++ — Resilient AI Task Runner"
       echo ""
       echo "Usage: ./ralph++.sh [OPTIONS]"
       echo ""
@@ -89,10 +93,11 @@ while [[ $# -gt 0 ]]; do
       echo "  --prd FILE       Path to the PRD file (default: ./prd.json)"
       echo "                   Accepts .json directly or .md (auto-converts via /ralph)"
       echo "  --resume         Resume a previous run, retrying pending/failed stories"
-      echo "  --dry-run        Generate prompts without calling Claude"
+      echo "  --dry-run        Generate prompts without executing"
+      echo "  --engine ENGINE  AI engine to use: claude or gemini (default: claude)"
       echo "  --retries N      Max retry attempts per story (default: 10)"
-      echo "  --timeout SEC    Timeout in seconds per Claude call (default: 600)"
-      echo "  --max-turns N    Max agentic turns per Claude call (default: 50)"
+      echo "  --timeout SEC    Timeout in seconds per engine call (default: 600)"
+      echo "  --max-turns N    Max agentic turns per call (default: 50, claude only)"
       echo "  --cost           Show per-story and total cost in the status table"
       echo "  --diag-learn     On failure: capture git diff and run a diagnosis call,"
       echo "                   then inject both into the retry prompt so the next"
@@ -105,12 +110,25 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Validate environment ─────────────────────────────────────────
-for cmd in jq claude bc; do
+# Validate engine choice
+case "$ENGINE" in
+  claude|gemini) ;;
+  *) echo -e "${RED}${ICO_FAIL} Unknown engine: ${BOLD}$ENGINE${RST}${RED} (must be claude or gemini)${RST}"; exit 1 ;;
+esac
+
+# Common dependencies
+for cmd in jq bc; do
   if ! command -v "$cmd" &>/dev/null; then
     echo -e "${RED}${ICO_FAIL} Missing required command: ${BOLD}$cmd${RST}"
     exit 1
   fi
 done
+
+# Engine-specific CLI
+if ! command -v "$ENGINE" &>/dev/null; then
+  echo -e "${RED}${ICO_FAIL} Missing required command: ${BOLD}$ENGINE${RST}${RED} (needed for --engine $ENGINE)${RST}"
+  exit 1
+fi
 
 # ── Provide timeout fallback for macOS ─────────────────────────
 if ! command -v timeout &>/dev/null; then
@@ -133,6 +151,105 @@ if ! command -v timeout &>/dev/null; then
     fi
     return $exit_code
   }
+fi
+
+# ── Engine Adapter Functions ─────────────────────────────────────
+# Each engine implements: convert_cmd, exec_cmd, diag_cmd, parse_response
+# Results from parse_response are returned via _parsed_* global variables.
+
+# ── Claude Code adapter ──────────────────────────────────────────
+
+claude_convert_cmd() {
+  local prompt="$1"
+  timeout 120 claude --print --max-turns 1 --dangerously-skip-permissions -p "$prompt" 2>/dev/null
+}
+
+claude_exec_cmd() {
+  local prompt="$1" out_file="$2"
+  timeout "$TIMEOUT_SEC" claude \
+    --print --output-format json --max-turns "$MAX_TURNS" \
+    --dangerously-skip-permissions -p "$prompt" > "$out_file" 2>/dev/null
+}
+
+claude_diag_cmd() {
+  local prompt="$1"
+  timeout 120 claude --print --max-turns 1 --dangerously-skip-permissions -p "$prompt" 2>/dev/null
+}
+
+claude_parse_response() {
+  local out_file="$1"
+  # NOTE: jq's // operator treats false as falsy, so .is_error // true
+  # would ALWAYS return true. Use if/then/else instead.
+  _parsed_is_error=$(jq -r 'if has("is_error") then .is_error else true end' "$out_file" 2>/dev/null || echo "true")
+  _parsed_result=$(jq -r '.result // empty' "$out_file" 2>/dev/null || echo "")
+  _parsed_cost_usd=$(jq -r '.total_cost_usd // 0' "$out_file" 2>/dev/null || echo "0")
+  _parsed_subtype=$(jq -r '.subtype // "unknown"' "$out_file" 2>/dev/null || echo "unknown")
+  _parsed_num_turns=$(jq -r '.num_turns // 0' "$out_file" 2>/dev/null || echo "0")
+  _parsed_in_tokens=$(jq -r '.usage.input_tokens // 0' "$out_file" 2>/dev/null || echo "0")
+  _parsed_out_tokens=$(jq -r '.usage.output_tokens // 0' "$out_file" 2>/dev/null || echo "0")
+  _parsed_cache_read=$(jq -r '.usage.cache_read_input_tokens // 0' "$out_file" 2>/dev/null || echo "0")
+  _parsed_cache_create=$(jq -r '.usage.cache_creation_input_tokens // 0' "$out_file" 2>/dev/null || echo "0")
+}
+
+# ── Gemini CLI adapter ───────────────────────────────────────────
+
+gemini_convert_cmd() {
+  local prompt="$1"
+  timeout 120 gemini --yolo -p "$prompt" 2>/dev/null
+}
+
+gemini_exec_cmd() {
+  local prompt="$1" out_file="$2"
+  timeout "$TIMEOUT_SEC" gemini \
+    --yolo --output-format json -p "$prompt" > "$out_file" 2>/dev/null
+}
+
+gemini_diag_cmd() {
+  local prompt="$1"
+  timeout 120 gemini --yolo -p "$prompt" 2>/dev/null
+}
+
+gemini_parse_response() {
+  local out_file="$1"
+  # Gemini uses .error (null when OK) instead of .is_error boolean
+  local error_val
+  error_val=$(jq -r 'if .error == null then "null" else "error" end' "$out_file" 2>/dev/null || echo "error")
+  if [ "$error_val" = "null" ]; then
+    _parsed_is_error="false"
+  else
+    _parsed_is_error="true"
+  fi
+  _parsed_result=$(jq -r '.response // empty' "$out_file" 2>/dev/null || echo "")
+  _parsed_cost_usd="0"  # Gemini CLI does not report cost
+  _parsed_subtype=$(jq -r '.error.type // "unknown"' "$out_file" 2>/dev/null || echo "unknown")
+  _parsed_num_turns="0"  # Gemini CLI does not report turn count
+  # Gemini token structure: .stats.models[].tokens.{prompt, candidates, cached}
+  _parsed_in_tokens=$(jq -r '[.stats.models[]?.tokens.prompt // 0] | add // 0' "$out_file" 2>/dev/null || echo "0")
+  _parsed_out_tokens=$(jq -r '[.stats.models[]?.tokens.candidates // 0] | add // 0' "$out_file" 2>/dev/null || echo "0")
+  _parsed_cache_read=$(jq -r '[.stats.models[]?.tokens.cached // 0] | add // 0' "$out_file" 2>/dev/null || echo "0")
+  _parsed_cache_create="0"  # Gemini reports a single cached field, no separate creation
+}
+
+# ── Engine dispatchers ───────────────────────────────────────────
+
+engine_convert_cmd()    { "${ENGINE}_convert_cmd" "$@"; }
+engine_exec_cmd()       { "${ENGINE}_exec_cmd" "$@"; }
+engine_diag_cmd()       { "${ENGINE}_diag_cmd" "$@"; }
+engine_parse_response() { "${ENGINE}_parse_response" "$@"; }
+
+engine_name() {
+  case "$ENGINE" in
+    claude) echo "Claude Code" ;;
+    gemini) echo "Gemini CLI" ;;
+    *) echo "$ENGINE" ;;
+  esac
+}
+
+# ── Feature-gap warnings ────────────────────────────────────────
+if [ "$ENGINE" = "gemini" ]; then
+  [ -n "$_CLI_TURNS" ] && echo -e "${YLW}${ICO_WARN} --max-turns is ignored with Gemini CLI (no CLI flag); timeout is the backstop${RST}"
+  [ "$SHOW_COST" = true ] && echo -e "${YLW}${ICO_WARN} Gemini CLI does not report USD cost; cost column will show \$0${RST}"
+  echo -e "${GRY}  Using Gemini CLI defaults. To change model: gemini -m <model> or ~/.gemini/settings.json${RST}"
 fi
 
 if [ "$DIAG_LEARN" = true ] && ! command -v git &>/dev/null; then
@@ -167,11 +284,7 @@ if [[ "$PRD_FILE" == *.md ]]; then
     local_ralph_prompt=$(cat "$RALPH_PROMPT_FILE")
     local_md_content=$(cat "$PRD_FILE")
 
-    convert_output=$(timeout 120 claude \
-      --print \
-      --max-turns 1 \
-      --dangerously-skip-permissions \
-      -p "${local_ralph_prompt}
+    convert_output=$(engine_convert_cmd "${local_ralph_prompt}
 
 ---
 
@@ -179,12 +292,12 @@ ${local_md_content}
 
 ---
 
-IMPORTANT: Output ONLY the raw prd.json content. No markdown fences, no explanation, just valid JSON." 2>/dev/null) || {
+IMPORTANT: Output ONLY the raw prd.json content. No markdown fences, no explanation, just valid JSON.") || {
         echo -e "${RED}${ICO_FAIL} Markdown-to-JSON conversion failed (exit $?)${RST}"
         exit 1
       }
 
-    # Extract JSON — strip markdown fences if Claude wrapped it anyway
+    # Extract JSON — strip markdown fences if the engine wrapped it anyway
     json_body=$(echo "$convert_output" | sed -n '/^[[:space:]]*{/,/^[[:space:]]*}/p')
 
     # Validate the JSON has userStories
@@ -219,9 +332,11 @@ PRD_DESC=$(jq -r '.description // empty' "$PRD_FILE")
 _cfg_retries=$(jq -r '.config.maxRetries // empty' "$PRD_FILE" 2>/dev/null)
 _cfg_timeout=$(jq -r '.config.timeoutSeconds // empty' "$PRD_FILE" 2>/dev/null)
 _cfg_turns=$(jq -r '.config.maxTurns // empty' "$PRD_FILE" 2>/dev/null)
+_cfg_engine=$(jq -r '.config.engine // empty' "$PRD_FILE" 2>/dev/null)
 [ -z "$_CLI_RETRIES" ] && [ -n "$_cfg_retries" ] && MAX_RETRIES="$_cfg_retries"
 [ -z "$_CLI_TIMEOUT" ] && [ -n "$_cfg_timeout" ] && TIMEOUT_SEC="$_cfg_timeout"
 [ -z "$_CLI_TURNS" ]   && [ -n "$_cfg_turns" ]   && MAX_TURNS="$_cfg_turns"
+[ -z "$_CLI_ENGINE" ]  && [ -n "$_cfg_engine" ]  && ENGINE="$_cfg_engine"
 
 # Sort user stories by priority
 STORY_COUNT=$(jq '.userStories | length' "$PRD_FILE")
@@ -548,7 +663,7 @@ Now complete the task using a corrected approach."
     local result_file="$task_log_dir/attempt-${attempt}.result.txt"
 
     if [ "$DRY_RUN" = true ]; then
-      log_dim "[dry-run] Would run: claude --print -p <prompt> --output-format json"
+      log_dim "[dry-run] Would run: $ENGINE ... -p <prompt> --output-format json"
       echo "$full_prompt" > "$task_log_dir/attempt-${attempt}.prompt.md"
       log_ok "Dry run — skipped (no changes to prd.json)"
       return 0
@@ -559,15 +674,9 @@ Now complete the task using a corrected approach."
       pre_attempt_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
     fi
 
-    # ── Execute Claude ──
+    # ── Execute engine ──
     exit_code=0
-    timeout "$TIMEOUT_SEC" claude \
-      --print \
-      --output-format json \
-      --max-turns "$MAX_TURNS" \
-      --dangerously-skip-permissions \
-      -p "$full_prompt" \
-      > "$out_file" 2>/dev/null || exit_code=$?
+    engine_exec_cmd "$full_prompt" "$out_file" || exit_code=$?
 
     duration=$(( $(date +%s) - start_ts ))
     set_task_field "$sid" "duration_sec" "$duration"
@@ -575,22 +684,17 @@ Now complete the task using a corrected approach."
     # Save the prompt used for this attempt
     echo "$full_prompt" > "$task_log_dir/attempt-${attempt}.prompt.md"
 
-    # ── Parse result ──
-    local is_error result_text cost_usd subtype num_turns
-    # NOTE: jq's // operator treats false as falsy, so .is_error // true
-    # would ALWAYS return true. Use if/then/else instead.
-    is_error=$(jq -r 'if has("is_error") then .is_error else true end' "$out_file" 2>/dev/null || echo "true")
-    result_text=$(jq -r '.result // empty' "$out_file" 2>/dev/null || echo "")
-    cost_usd=$(jq -r '.total_cost_usd // 0' "$out_file" 2>/dev/null || echo "0")
-    subtype=$(jq -r '.subtype // "unknown"' "$out_file" 2>/dev/null || echo "unknown")
-    num_turns=$(jq -r '.num_turns // 0' "$out_file" 2>/dev/null || echo "0")
-
-    # ── Extract tokens ──
-    local in_tokens out_tokens cache_read cache_create
-    in_tokens=$(jq -r '.usage.input_tokens // 0' "$out_file" 2>/dev/null || echo "0")
-    out_tokens=$(jq -r '.usage.output_tokens // 0' "$out_file" 2>/dev/null || echo "0")
-    cache_read=$(jq -r '.usage.cache_read_input_tokens // 0' "$out_file" 2>/dev/null || echo "0")
-    cache_create=$(jq -r '.usage.cache_creation_input_tokens // 0' "$out_file" 2>/dev/null || echo "0")
+    # ── Parse result (engine-normalized) ──
+    engine_parse_response "$out_file"
+    local is_error="$_parsed_is_error"
+    local result_text="$_parsed_result"
+    local cost_usd="$_parsed_cost_usd"
+    local subtype="$_parsed_subtype"
+    local num_turns="$_parsed_num_turns"
+    local in_tokens="$_parsed_in_tokens"
+    local out_tokens="$_parsed_out_tokens"
+    local cache_read="$_parsed_cache_read"
+    local cache_create="$_parsed_cache_create"
 
     # Accumulate cost and tokens
     local prev_cost new_cost prev_in prev_out
@@ -625,7 +729,7 @@ Now complete the task using a corrected approach."
       raw_error="TIMEOUT: Task exceeded ${TIMEOUT_SEC}s limit"
       log_err "${BOLD}$sid${RST}${RED} timed out after $(fmt_duration "$TIMEOUT_SEC")"
     elif [ "$subtype" = "error_max_turns" ]; then
-      raw_error="MAX_TURNS: Claude hit max turns ($num_turns/$MAX_TURNS) without completing. Subtype: $subtype"
+      raw_error="MAX_TURNS: Engine hit max turns ($num_turns/$MAX_TURNS) without completing. Subtype: $subtype"
       log_err "${BOLD}$sid${RST}${RED} hit max turns ($num_turns) — subtype: $subtype"
     else
       raw_error="Exit code: $exit_code | is_error: $is_error | subtype: $subtype | num_turns: $num_turns | Output empty: $([ -z "$result_text" ] && echo yes || echo no)"
@@ -647,7 +751,7 @@ Now complete the task using a corrected approach."
       fi
     fi
 
-    # ── Error analysis via separate Claude call (only with --diag-learn) ──
+    # ── Error analysis via separate engine call (only with --diag-learn) ──
     local diagnosis=""
     if [ "$DIAG_LEARN" = true ]; then
       log_info "${ICO_BRAIN} Analyzing failure for retry guidance..."
@@ -676,11 +780,7 @@ Provide a concise, actionable diagnosis (max 10 lines):
 
 Be concrete. Reference specific files, functions, or commands."
 
-      diagnosis=$(timeout 120 claude \
-        --print \
-        --max-turns 1 \
-        --dangerously-skip-permissions \
-        -p "$analysis_prompt" 2>/dev/null) || {
+      diagnosis=$(engine_diag_cmd "$analysis_prompt") || {
           local diag_exit=$?
           diagnosis="[Analysis unavailable — exit $diag_exit]"
           log_dim "Diagnosis call failed (exit $diag_exit)"
@@ -703,7 +803,7 @@ Attempt: $attempt / $max_att
 Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 ════════════════════════════════════════════════════════════════
 
-── Claude Response ──
+── Engine Response ──
 exit_code:   $exit_code
 is_error:    $is_error
 subtype:     $subtype
@@ -764,10 +864,11 @@ main() {
 
   banner \
     "Ralph Wiggum — Task Runner" \
-    "Project: $PROJECT  |  Stories: $STORY_COUNT  |  Max retries: $MAX_RETRIES  |  Timeout: ${TIMEOUT_SEC}s"
+    "Project: $PROJECT  |  Engine: $(engine_name)  |  Stories: $STORY_COUNT  |  Max retries: $MAX_RETRIES  |  Timeout: ${TIMEOUT_SEC}s"
 
   [ -n "$BRANCH" ]   && log_info "Branch:  ${BOLD}$BRANCH${RST}"
   [ -n "$PRD_DESC" ]  && log_info "PRD:     ${DIM}$PRD_DESC${RST}"
+  log_info "Engine:  ${BOLD}$(engine_name)${RST}"
   log_info "File:    ${DIM}$PRD_FILE${RST}"
   log_info "State:   ${DIM}$STATE_FILE${RST}"
   log_info "Logs:    ${DIM}$LOG_DIR${RST}"
