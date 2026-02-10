@@ -1,6 +1,6 @@
 # Ralph++
 
-A resilient task runner that orchestrates AI coding agents to execute user stories from a PRD file — with per-task retries, crash-safe state, and a terminal UI for progress tracking.
+An enhancement of the original [Ralph Wiggum loop](https://ghuntley.com/ralph/) concept by Geoffrey Huntley — a resilient task runner that orchestrates AI coding agents to execute user stories from a PRD file, with per-task retries, crash-safe state, and a terminal UI for progress tracking.
 
 Ralph++ reads a structured PRD (as JSON or Markdown), splits it into user stories sorted by priority, and feeds each one to an AI engine ([Claude Code](https://docs.anthropic.com/en/docs/claude-code) or [Gemini CLI](https://github.com/google-gemini/gemini-cli)) as an autonomous coding agent. If a story fails, it retries with context about what went wrong. When it's done, your PRD is updated in place with pass/fail status.
 
