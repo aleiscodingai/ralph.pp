@@ -262,6 +262,12 @@ if [ ! -f "$PRD_FILE" ]; then
   exit 1
 fi
 
+log_info()  { echo -e "${BLU}${ICO_TASK}${RST} ${WHT}$*${RST}"; }
+log_ok()    { echo -e "${GRN}${ICO_PASS}${RST} ${GRN}$*${RST}"; }
+log_warn()  { echo -e "${YLW}${ICO_WARN}${RST} ${YLW}$*${RST}"; }
+log_err()   { echo -e "${RED}${ICO_FAIL}${RST} ${RED}$*${RST}"; }
+log_dim()   { echo -e "${GRY}  $*${RST}"; }
+
 # ── Convert .md PRD to JSON if needed ────────────────────────────
 RALPH_PROMPT_FILE="$HOME/.claude/commands/ralph.md"
 
@@ -366,12 +372,6 @@ banner() {
   [ -n "${2:-}" ] && printf "${GRY}  %-*s${RST}\n" "$((cols - 4))" "$2"
   hr "═"
 }
-
-log_info()  { echo -e "${BLU}${ICO_TASK}${RST} ${WHT}$*${RST}"; }
-log_ok()    { echo -e "${GRN}${ICO_PASS}${RST} ${GRN}$*${RST}"; }
-log_warn()  { echo -e "${YLW}${ICO_WARN}${RST} ${YLW}$*${RST}"; }
-log_err()   { echo -e "${RED}${ICO_FAIL}${RST} ${RED}$*${RST}"; }
-log_dim()   { echo -e "${GRY}  $*${RST}"; }
 
 fmt_duration() {
   local sec=$1
