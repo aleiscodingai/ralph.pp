@@ -161,7 +161,7 @@ fi
 
 claude_convert_cmd() {
   local prompt="$1"
-  timeout 120 claude --print --max-turns 1 --dangerously-skip-permissions -p "$prompt" 2>/dev/null
+  timeout 120 claude --print --max-turns 10 --dangerously-skip-permissions -p "$prompt" 2>/dev/null
 }
 
 claude_exec_cmd() {
