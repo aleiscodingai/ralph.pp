@@ -15,7 +15,7 @@
 #   • Updates prd.json passes/notes fields in place
 #   • Dark-mode terminal UI with progress tracking
 #
-# Requirements: bash 4+, jq, claude CLI or gemini CLI
+# Requirements: bash 4+, jq, claude CLI or gemini CLI or codex CLI
 
 set -euo pipefail
 
@@ -64,10 +64,16 @@ MAX_RETRIES="${RALPH_MAX_RETRIES:-10}"
 TIMEOUT_SEC="${RALPH_TIMEOUT:-600}"
 MAX_TURNS="${RALPH_MAX_TURNS:-50}"
 ENGINE="${RALPH_ENGINE:-claude}"
+CODEX_MODE="${RALPH_CODEX_MODE:-full-auto}"
+CODEX_MODEL="${RALPH_CODEX_MODEL:-}"
 _CLI_RETRIES=""
 _CLI_TIMEOUT=""
 _CLI_TURNS=""
 _CLI_ENGINE=""
+_CLI_CODEX_MODE=""
+_CLI_CODEX_MODEL=""
+_CODEX_HAS_EXEC=""
+_CODEX_HAS_JSON=""
 
 # ── Parse arguments ───────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -81,6 +87,10 @@ while [[ $# -gt 0 ]]; do
     --max-turns) MAX_TURNS="$2"; _CLI_TURNS=1; shift 2 ;;
     --engine)    ENGINE="$2"; _CLI_ENGINE=1; shift 2 ;;
     --engine=*)  ENGINE="${1#*=}"; _CLI_ENGINE=1; shift ;;
+    --codex-mode)  CODEX_MODE="$2"; _CLI_CODEX_MODE=1; shift 2 ;;
+    --codex-mode=*) CODEX_MODE="${1#*=}"; _CLI_CODEX_MODE=1; shift ;;
+    --codex-model) CODEX_MODEL="$2"; _CLI_CODEX_MODEL=1; shift 2 ;;
+    --codex-model=*) CODEX_MODEL="${1#*=}"; _CLI_CODEX_MODEL=1; shift ;;
     --cost)         SHOW_COST=true; shift ;;
     --diag-learn) DIAG_LEARN=true; shift ;;
     -h|--help)
@@ -94,10 +104,12 @@ while [[ $# -gt 0 ]]; do
       echo "                   Accepts .json directly or .md (auto-converts via /ralph)"
       echo "  --resume         Resume a previous run, retrying pending/failed stories"
       echo "  --dry-run        Generate prompts without executing"
-      echo "  --engine ENGINE  AI engine to use: claude or gemini (default: claude)"
+      echo "  --engine ENGINE  AI engine to use: claude, gemini, or codex (default: claude)"
       echo "  --retries N      Max retry attempts per story (default: 10)"
       echo "  --timeout SEC    Timeout in seconds per engine call (default: 600)"
       echo "  --max-turns N    Max agentic turns per call (default: 50, claude only)"
+      echo "  --codex-mode M   Codex approval mode: suggest, auto-edit, or full-auto"
+      echo "  --codex-model M  Codex model override (passes through to: codex -m M)"
       echo "  --cost           Show per-story and total cost in the status table"
       echo "  --diag-learn     On failure: capture git diff and run a diagnosis call,"
       echo "                   then inject both into the retry prompt so the next"
@@ -110,12 +122,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Validate environment ─────────────────────────────────────────
-# Validate engine choice
-case "$ENGINE" in
-  claude|gemini) ;;
-  *) echo -e "${RED}${ICO_FAIL} Unknown engine: ${BOLD}$ENGINE${RST}${RED} (must be claude or gemini)${RST}"; exit 1 ;;
-esac
-
 # Common dependencies
 for cmd in jq bc; do
   if ! command -v "$cmd" &>/dev/null; then
@@ -123,12 +129,6 @@ for cmd in jq bc; do
     exit 1
   fi
 done
-
-# Engine-specific CLI
-if ! command -v "$ENGINE" &>/dev/null; then
-  echo -e "${RED}${ICO_FAIL} Missing required command: ${BOLD}$ENGINE${RST}${RED} (needed for --engine $ENGINE)${RST}"
-  exit 1
-fi
 
 # ── Provide timeout fallback for macOS ─────────────────────────
 if ! command -v timeout &>/dev/null; then
@@ -230,6 +230,139 @@ gemini_parse_response() {
   _parsed_cache_create="0"  # Gemini reports a single cached field, no separate creation
 }
 
+# ── Codex CLI adapter ────────────────────────────────────────────
+
+codex_mode_flag() {
+  case "$CODEX_MODE" in
+    suggest) echo "--suggest" ;;
+    auto-edit) echo "--auto-edit" ;;
+    full-auto) echo "--full-auto" ;;
+    *) echo "INVALID" ;;
+  esac
+}
+
+codex_detect_capabilities() {
+  if [ -n "$_CODEX_HAS_EXEC" ]; then
+    return
+  fi
+  if codex exec --help >/dev/null 2>&1; then
+    _CODEX_HAS_EXEC="1"
+    if codex exec --help 2>/dev/null | grep -q -- '--json'; then
+      _CODEX_HAS_JSON="1"
+    else
+      _CODEX_HAS_JSON="0"
+    fi
+  else
+    _CODEX_HAS_EXEC="0"
+    _CODEX_HAS_JSON="0"
+  fi
+}
+
+codex_convert_cmd() {
+  local prompt="$1"
+  local mode_flag
+  mode_flag=$(codex_mode_flag)
+  [ "$mode_flag" = "INVALID" ] && echo "Invalid CODEX_MODE: $CODEX_MODE" && return 1
+
+  local model_args=()
+  [ -n "$CODEX_MODEL" ] && model_args=(-m "$CODEX_MODEL")
+
+  codex_detect_capabilities
+  if [ "$_CODEX_HAS_EXEC" = "1" ]; then
+    timeout 120 codex exec "$mode_flag" "${model_args[@]}" <<< "$prompt" 2>/dev/null
+  else
+    timeout 120 codex "$mode_flag" "${model_args[@]}" <<< "$prompt" 2>/dev/null
+  fi
+}
+
+codex_exec_cmd() {
+  local prompt="$1" out_file="$2"
+  local mode_flag
+  mode_flag=$(codex_mode_flag)
+  [ "$mode_flag" = "INVALID" ] && echo "Invalid CODEX_MODE: $CODEX_MODE" && return 1
+
+  local model_args=()
+  [ -n "$CODEX_MODEL" ] && model_args=(-m "$CODEX_MODEL")
+
+  codex_detect_capabilities
+  if [ "$_CODEX_HAS_EXEC" = "1" ]; then
+    if [ "$_CODEX_HAS_JSON" = "1" ]; then
+      timeout "$TIMEOUT_SEC" codex exec "$mode_flag" "${model_args[@]}" --json <<< "$prompt" > "$out_file" 2>/dev/null
+    else
+      timeout "$TIMEOUT_SEC" codex exec "$mode_flag" "${model_args[@]}" <<< "$prompt" > "$out_file" 2>/dev/null
+    fi
+  else
+    timeout "$TIMEOUT_SEC" codex "$mode_flag" "${model_args[@]}" <<< "$prompt" > "$out_file" 2>/dev/null
+  fi
+}
+
+codex_diag_cmd() {
+  local prompt="$1"
+  local mode_flag
+  mode_flag=$(codex_mode_flag)
+  [ "$mode_flag" = "INVALID" ] && echo "Invalid CODEX_MODE: $CODEX_MODE" && return 1
+
+  local model_args=()
+  [ -n "$CODEX_MODEL" ] && model_args=(-m "$CODEX_MODEL")
+
+  codex_detect_capabilities
+  if [ "$_CODEX_HAS_EXEC" = "1" ]; then
+    timeout 120 codex exec "$mode_flag" "${model_args[@]}" <<< "$prompt" 2>/dev/null
+  else
+    timeout 120 codex "$mode_flag" "${model_args[@]}" <<< "$prompt" 2>/dev/null
+  fi
+}
+
+codex_parse_response() {
+  local out_file="$1"
+
+  if jq -s . "$out_file" >/dev/null 2>&1; then
+    _parsed_is_error=$(jq -r -s '
+      def iserr:
+        ( (has("is_error") and .is_error == true)
+          or (has("error") and .error != null)
+          or (.status? == "error") );
+      [ .[] | iserr ] | any | if . then "true" else "false" end
+    ' "$out_file" 2>/dev/null || echo "true")
+
+    _parsed_result=$(jq -r -s '
+      def pick:
+        (.final_output // .result //
+         (if (.message|type)=="object" then (.message.content // empty) else empty end) //
+         .content // empty);
+      [ .[] | pick ] | map(select(length > 0)) | last // empty
+    ' "$out_file" 2>/dev/null || echo "")
+
+    _parsed_cost_usd=$(jq -r -s '
+      [ .[] | .usage? | .total_cost_usd? // .cost_usd? // 0 ] | add // 0
+    ' "$out_file" 2>/dev/null || echo "0")
+
+    _parsed_subtype=$(jq -r -s '
+      [ .[] | .error.type? // .error? // .subtype? // empty ] | last // "unknown"
+    ' "$out_file" 2>/dev/null || echo "unknown")
+
+    _parsed_num_turns="0"
+    _parsed_in_tokens=$(jq -r -s '
+      [ .[] | .usage? | .input_tokens? // .prompt_tokens? // 0 ] | add // 0
+    ' "$out_file" 2>/dev/null || echo "0")
+    _parsed_out_tokens=$(jq -r -s '
+      [ .[] | .usage? | .output_tokens? // .completion_tokens? // 0 ] | add // 0
+    ' "$out_file" 2>/dev/null || echo "0")
+    _parsed_cache_read="0"
+    _parsed_cache_create="0"
+  else
+    _parsed_is_error="false"
+    _parsed_result=$(cat "$out_file" 2>/dev/null || echo "")
+    _parsed_cost_usd="0"
+    _parsed_subtype="unknown"
+    _parsed_num_turns="0"
+    _parsed_in_tokens="0"
+    _parsed_out_tokens="0"
+    _parsed_cache_read="0"
+    _parsed_cache_create="0"
+  fi
+}
+
 # ── Engine dispatchers ───────────────────────────────────────────
 
 engine_convert_cmd()    { "${ENGINE}_convert_cmd" "$@"; }
@@ -241,6 +374,7 @@ engine_name() {
   case "$ENGINE" in
     claude) echo "Claude Code" ;;
     gemini) echo "Gemini CLI" ;;
+    codex) echo "Codex CLI" ;;
     *) echo "$ENGINE" ;;
   esac
 }
@@ -250,6 +384,12 @@ if [ "$ENGINE" = "gemini" ]; then
   [ -n "$_CLI_TURNS" ] && echo -e "${YLW}${ICO_WARN} --max-turns is ignored with Gemini CLI (no CLI flag); timeout is the backstop${RST}"
   [ "$SHOW_COST" = true ] && echo -e "${YLW}${ICO_WARN} Gemini CLI does not report USD cost; cost column will show \$0${RST}"
   echo -e "${GRY}  Using Gemini CLI defaults. To change model: gemini -m <model> or ~/.gemini/settings.json${RST}"
+fi
+
+if [ "$ENGINE" = "codex" ]; then
+  [ -n "$_CLI_TURNS" ] && echo -e "${YLW}${ICO_WARN} --max-turns is ignored with Codex CLI; timeout is the backstop${RST}"
+  [ "$SHOW_COST" = true ] && echo -e "${YLW}${ICO_WARN} Codex CLI may not report USD cost; cost column may show \$0${RST}"
+  [ -n "$CODEX_MODEL" ] && echo -e "${GRY}  Codex model override: ${CODEX_MODEL}${RST}"
 fi
 
 if [ "$DIAG_LEARN" = true ] && ! command -v git &>/dev/null; then
@@ -284,17 +424,33 @@ if [[ "$PRD_FILE" == *.md ]]; then
       exit 1
     fi
 
+    # Validate engine choice and CLI before conversion (uses current ENGINE)
+    case "$ENGINE" in
+      claude|gemini|codex) ;;
+      *) echo -e "${RED}${ICO_FAIL} Unknown engine: ${BOLD}$ENGINE${RST}${RED} (must be claude, gemini, or codex)${RST}"; exit 1 ;;
+    esac
+    if ! command -v "$ENGINE" &>/dev/null; then
+      echo -e "${RED}${ICO_FAIL} Missing required command: ${BOLD}$ENGINE${RST}${RED} (needed for --engine $ENGINE)${RST}"
+      exit 1
+    fi
+    if [ "$ENGINE" = "codex" ]; then
+      case "$CODEX_MODE" in
+        suggest|auto-edit|full-auto) ;;
+        *) echo -e "${RED}${ICO_FAIL} Invalid --codex-mode: ${BOLD}$CODEX_MODE${RST}${RED} (must be suggest, auto-edit, or full-auto)${RST}"; exit 1 ;;
+      esac
+    fi
+
     log_info "Converting markdown PRD to JSON..."
     log_dim "Source: $PRD_FILE"
 
-    local_ralph_prompt=$(cat "$RALPH_PROMPT_FILE")
-    local_md_content=$(cat "$PRD_FILE")
+    ralph_prompt=$(cat "$RALPH_PROMPT_FILE")
+    md_content=$(cat "$PRD_FILE")
 
-    convert_output=$(engine_convert_cmd "${local_ralph_prompt}
+    convert_output=$(engine_convert_cmd "${ralph_prompt}
 
 ---
 
-${local_md_content}
+${md_content}
 
 ---
 
@@ -303,8 +459,20 @@ IMPORTANT: Output ONLY the raw prd.json content. No markdown fences, no explanat
         exit 1
       }
 
-    # Extract JSON — strip markdown fences if the engine wrapped it anyway
-    json_body=$(echo "$convert_output" | sed -n '/^[[:space:]]*{/,/^[[:space:]]*}/p')
+    # Extract JSON — best-effort brace match to handle fenced or verbose output
+    json_body=$(echo "$convert_output" | awk '
+      BEGIN {c=0; start=0; out=""}
+      {
+        line=$0
+        for (i=1; i<=length(line); i++) {
+          ch=substr(line,i,1)
+          if (ch=="{") { if (!start) start=1; c++ }
+          if (start) out=out ch
+          if (ch=="}") { c--; if (start && c==0) { print out; exit } }
+        }
+        if (start) out=out "\n"
+      }
+    ')
 
     # Validate the JSON has userStories
     if ! echo "$json_body" | jq -e '.userStories | length > 0' &>/dev/null; then
@@ -339,10 +507,31 @@ _cfg_retries=$(jq -r '.config.maxRetries // empty' "$PRD_FILE" 2>/dev/null)
 _cfg_timeout=$(jq -r '.config.timeoutSeconds // empty' "$PRD_FILE" 2>/dev/null)
 _cfg_turns=$(jq -r '.config.maxTurns // empty' "$PRD_FILE" 2>/dev/null)
 _cfg_engine=$(jq -r '.config.engine // empty' "$PRD_FILE" 2>/dev/null)
+_cfg_codex_mode=$(jq -r '.config.codexMode // empty' "$PRD_FILE" 2>/dev/null)
+_cfg_codex_model=$(jq -r '.config.codexModel // empty' "$PRD_FILE" 2>/dev/null)
 [ -z "$_CLI_RETRIES" ] && [ -n "$_cfg_retries" ] && MAX_RETRIES="$_cfg_retries"
 [ -z "$_CLI_TIMEOUT" ] && [ -n "$_cfg_timeout" ] && TIMEOUT_SEC="$_cfg_timeout"
 [ -z "$_CLI_TURNS" ]   && [ -n "$_cfg_turns" ]   && MAX_TURNS="$_cfg_turns"
 [ -z "$_CLI_ENGINE" ]  && [ -n "$_cfg_engine" ]  && ENGINE="$_cfg_engine"
+[ -z "$_CLI_CODEX_MODE" ]  && [ -n "$_cfg_codex_mode" ]  && CODEX_MODE="$_cfg_codex_mode"
+[ -z "$_CLI_CODEX_MODEL" ] && [ -n "$_cfg_codex_model" ] && CODEX_MODEL="$_cfg_codex_model"
+
+# Validate engine choice and CLI after config overrides
+case "$ENGINE" in
+  claude|gemini|codex) ;;
+  *) echo -e "${RED}${ICO_FAIL} Unknown engine: ${BOLD}$ENGINE${RST}${RED} (must be claude, gemini, or codex)${RST}"; exit 1 ;;
+esac
+if ! command -v "$ENGINE" &>/dev/null; then
+  echo -e "${RED}${ICO_FAIL} Missing required command: ${BOLD}$ENGINE${RST}${RED} (needed for --engine $ENGINE)${RST}"
+  exit 1
+fi
+
+if [ "$ENGINE" = "codex" ]; then
+  case "$CODEX_MODE" in
+    suggest|auto-edit|full-auto) ;;
+    *) echo -e "${RED}${ICO_FAIL} Invalid --codex-mode: ${BOLD}$CODEX_MODE${RST}${RED} (must be suggest, auto-edit, or full-auto)${RST}"; exit 1 ;;
+  esac
+fi
 
 # Sort user stories by priority
 STORY_COUNT=$(jq '.userStories | length' "$PRD_FILE")
@@ -390,6 +579,23 @@ fmt_tokens() {
   else
     printf "%d" "$n"
   fi
+}
+
+num_or_zero() {
+  local v="${1:-0}"
+  if [[ "$v" =~ ^-?[0-9]+$ ]]; then
+    echo "$v"
+  else
+    echo 0
+  fi
+}
+
+is_git_repo() {
+  command -v git &>/dev/null && git rev-parse --is-inside-work-tree &>/dev/null
+}
+
+is_git_clean() {
+  git diff --quiet && git diff --cached --quiet
 }
 
 progress_bar() {
@@ -601,7 +807,7 @@ run_task() {
   attempt=$(get_task_field "$sid" "attempt")
   attempt=$((${attempt:-0}))
   max_att=$MAX_RETRIES
-  local last_attempt_diff="" last_raw_error="" pre_attempt_sha=""
+  local last_attempt_diff="" last_raw_error="" pre_attempt_sha="" pre_attempt_clean="false"
 
   while (( attempt < max_att )); do
     attempt=$((attempt + 1))
@@ -635,7 +841,7 @@ ${last_raw_error}
 ${last_attempt_diff}
 \`\`\`
 
-Now complete the task. Fix what the previous attempt got wrong. Do NOT repeat the same mistakes."
+Now complete the task. Fix what the previous attempt got wrong. Do NOT repeat the same mistakes.
       else
         full_prompt="${base_prompt}
 
@@ -644,7 +850,7 @@ Now complete the task. Fix what the previous attempt got wrong. Do NOT repeat th
 The previous attempt failed with:
 ${last_raw_error}
 
-Now complete the task using a corrected approach."
+Now complete the task using a corrected approach.
       fi
     fi
 
@@ -672,6 +878,10 @@ Now complete the task using a corrected approach."
     # ── Capture git state for diff-context ──
     if [ "$DIAG_LEARN" = true ]; then
       pre_attempt_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
+    fi
+    if [ "$ENGINE" = "codex" ] && is_git_repo && is_git_clean; then
+      pre_attempt_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
+      pre_attempt_clean="true"
     fi
 
     # ── Execute engine ──
@@ -704,17 +914,33 @@ Now complete the task using a corrected approach."
     set_task_field "$sid" "total_cost" "$new_cost"
 
     prev_in=$(get_task_field "$sid" "input_tokens")
-    prev_in=${prev_in:-0}
+    prev_in=$(num_or_zero "${prev_in:-0}")
+    in_tokens=$(num_or_zero "$in_tokens")
+    cache_read=$(num_or_zero "$cache_read")
+    cache_create=$(num_or_zero "$cache_create")
     set_task_field "$sid" "input_tokens" "$(( prev_in + in_tokens + cache_read + cache_create ))"
 
     prev_out=$(get_task_field "$sid" "output_tokens")
-    prev_out=${prev_out:-0}
+    prev_out=$(num_or_zero "${prev_out:-0}")
+    out_tokens=$(num_or_zero "$out_tokens")
     set_task_field "$sid" "output_tokens" "$(( prev_out + out_tokens ))"
 
     echo "$result_text" > "$result_file"
 
     # ── Success ──
     if [ "$exit_code" -eq 0 ] && [ "$is_error" = "false" ] && [ -n "$result_text" ]; then
+      if [ "$ENGINE" = "codex" ] && [ "$pre_attempt_clean" = "true" ] && [ -n "$pre_attempt_sha" ]; then
+        if git diff --name-only "$pre_attempt_sha" 2>/dev/null | grep -q .; then
+          : # changes detected
+        else
+          last_raw_error="NO_CHANGES: Codex reported success but no file changes were detected."
+          log_err "${BOLD}$sid${RST}${RED} produced no file changes — retrying${RST}"
+          # fall through to failure handling
+        fi
+      fi
+    fi
+
+    if [ "$exit_code" -eq 0 ] && [ "$is_error" = "false" ] && [ -n "$result_text" ] && [ -z "$last_raw_error" ]; then
       log_ok "${BOLD}$sid${RST}${GRN} — $title"
       log_dim "Completed in $(fmt_duration "$duration") | Cost: \$$cost_usd"
       set_task_field "$sid" "status" "success"
@@ -951,7 +1177,7 @@ main() {
 
   if (( failed > 0 )); then
     log_warn "Some stories failed. Logs at: ${DIM}$LOG_DIR${RST}"
-    log_info "To retry failed stories: ${BOLD}./ralph.sh --prd $PRD_FILE --resume${RST}"
+    log_info "To retry failed stories: ${BOLD}./ralph++.sh --prd $PRD_FILE --resume${RST}"
     exit 1
   elif (( completed == STORY_COUNT )); then
     echo -e "  ${BG_GRN}${BOLD}${WHT}  🎉  ALL USER STORIES COMPLETED  ${RST}"

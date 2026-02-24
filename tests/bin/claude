@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+cat <<'JSON'
+{"project":"test","branchName":"ralph/test","description":"x","userStories":[{"id":"US-1","title":"t","description":"d","acceptanceCriteria":["a"],"priority":1,"passes":false,"notes":""}]}
+JSON

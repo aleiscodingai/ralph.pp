@@ -2,7 +2,7 @@
 
 An enhancement of the original [Ralph Wiggum loop](https://ghuntley.com/ralph/) concept by Geoffrey Huntley — a resilient task runner that orchestrates AI coding agents to execute user stories from a PRD file, with per-task retries, crash-safe state, and a terminal UI for progress tracking.
 
-Ralph++ reads a structured PRD (as JSON or Markdown), splits it into user stories sorted by priority, and feeds each one to an AI engine ([Claude Code](https://docs.anthropic.com/en/docs/claude-code) or [Gemini CLI](https://github.com/google-gemini/gemini-cli)) as an autonomous coding agent. If a story fails, it retries with context about what went wrong. When it's done, your PRD is updated in place with pass/fail status.
+Ralph++ reads a structured PRD (as JSON or Markdown), splits it into user stories sorted by priority, and feeds each one to an AI engine ([Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or [Codex CLI](https://help.openai.com/en/articles/11096431-openai-codex-ligetting-started)) as an autonomous coding agent. If a story fails, it retries with context about what went wrong. When it's done, your PRD is updated in place with pass/fail status.
 
 ## Requirements
 
@@ -10,6 +10,7 @@ Ralph++ reads a structured PRD (as JSON or Markdown), splits it into user storie
 - **[jq](https://jqlang.github.io/jq/)** for JSON processing
 - **[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)** (`claude` command) — default engine
 - **[Gemini CLI](https://github.com/google-gemini/gemini-cli)** (`gemini` command) — alternative engine
+- **[Codex CLI](https://help.openai.com/en/articles/11096431-openai-codex-ligetting-started)** (`codex` command) — alternative engine
 - **bc** for cost calculations
 - **git** (only required with `--diag-learn`)
 
@@ -23,6 +24,12 @@ Only one engine CLI is required — whichever you select with `--engine`.
 
 # Run with Gemini CLI
 ./ralph++.sh --prd my-feature.json --engine gemini
+
+# Run with Codex CLI (full-auto mode by default)
+./ralph++.sh --prd my-feature.json --engine codex
+
+# Run with Codex CLI and a model override
+./ralph++.sh --prd my-feature.json --engine codex --codex-model gpt-5-codex
 
 # Run with a Markdown PRD (auto-converts to JSON)
 ./ralph++.sh --prd my-feature.md
@@ -89,10 +96,12 @@ Options:
                    Accepts .json directly or .md (auto-converts via /ralph)
   --resume         Resume a previous run, retrying pending/failed stories
   --dry-run        Generate prompts without executing
-  --engine ENGINE  AI engine to use: claude or gemini (default: claude)
+  --engine ENGINE  AI engine to use: claude, gemini, or codex (default: claude)
   --retries N      Max retry attempts per story (default: 10)
   --timeout SEC    Timeout in seconds per engine call (default: 600)
   --max-turns N    Max agentic turns per call (default: 50, claude only)
+  --codex-mode M   Codex approval mode: suggest, auto-edit, or full-auto
+  --codex-model M  Codex model override (passes through to: codex -m M)
   --cost           Show per-story and total cost in the status table
   --diag-learn     On failure: capture git diff and run a diagnosis call,
                    then inject both into the retry prompt so the next
@@ -106,10 +115,12 @@ Override defaults without CLI flags:
 
 | Variable | Default | Description |
 |---|---|---|
-| `RALPH_ENGINE` | `claude` | AI engine to use (`claude` or `gemini`) |
+| `RALPH_ENGINE` | `claude` | AI engine to use (`claude`, `gemini`, or `codex`) |
 | `RALPH_MAX_RETRIES` | `10` | Max retry attempts per story |
 | `RALPH_TIMEOUT` | `600` | Timeout in seconds per engine call |
 | `RALPH_MAX_TURNS` | `50` | Max agentic turns per call (claude only) |
+| `RALPH_CODEX_MODE` | `full-auto` | Codex approval mode (`suggest`, `auto-edit`, or `full-auto`) |
+| `RALPH_CODEX_MODEL` | *(empty)* | Codex model override (passes through to `codex -m`) |
 
 **Precedence:** CLI flags > `prd.json` config block > environment variables > defaults.
 
@@ -121,27 +132,33 @@ Ralph++ supports multiple AI coding engines via the `--engine` flag:
 |---|---|---|
 | Claude Code (default) | `claude` | `--engine claude` |
 | Gemini CLI | `gemini` | `--engine gemini` |
+| Codex CLI | `codex` | `--engine codex` |
 
 ### Feature Parity
 
-| Feature | Claude Code | Gemini CLI |
-|---|---|---|
-| Non-interactive mode | `--print -p` | `-p` |
-| JSON output | `--output-format json` | `--output-format json` |
-| Skip permissions | `--dangerously-skip-permissions` | `--yolo` |
-| Max turns limit | `--max-turns N` | Not available (use timeout) |
-| Timeout | External `timeout` cmd | External `timeout` cmd |
-| USD cost tracking | Reported in JSON | Not available ($0) |
-| Token tracking | `.usage.input_tokens` / `.output_tokens` | `.stats.models[].tokens.prompt` / `.candidates` |
-| Cache tokens | Separate read/create fields | Single `.cached` field |
-| Error detection | `.is_error` boolean | `.error` object (null = OK) |
-| Result text | `.result` | `.response` |
-| Turn count | `.num_turns` | Not reported |
+| Feature | Claude Code | Gemini CLI | Codex CLI |
+|---|---|---|---|
+| Non-interactive mode | `--print -p` | `-p` | `codex exec` |
+| JSON output | `--output-format json` | `--output-format json` | `--json` (best-effort) |
+| Skip permissions | `--dangerously-skip-permissions` | `--yolo` | `--full-auto` |
+| Max turns limit | `--max-turns N` | Not available (use timeout) | Not available (use timeout) |
+| Timeout | External `timeout` cmd | External `timeout` cmd | External `timeout` cmd |
+| USD cost tracking | Reported in JSON | Not available ($0) | Best-effort (may be $0) |
+| Token tracking | `.usage.input_tokens` / `.output_tokens` | `.stats.models[].tokens.prompt` / `.candidates` | Best-effort from JSONL |
+| Cache tokens | Separate read/create fields | Single `.cached` field | Not reported |
+| Error detection | `.is_error` boolean | `.error` object (null = OK) | `error` / `is_error` / exit code |
+| Result text | `.result` | `.response` | JSONL final output or stdout |
+| Turn count | `.num_turns` | Not reported | Not reported |
 
 When using `--engine gemini`:
 - `--max-turns` is ignored (Gemini CLI has no equivalent flag; timeout serves as the backstop)
 - `--cost` column will show $0 (Gemini CLI doesn't report cost)
 - To change Gemini model: use `gemini -m <model>` directly or configure `~/.gemini/settings.json`
+
+When using `--engine codex`:
+- `--max-turns` is ignored (Codex CLI has no equivalent flag; timeout serves as the backstop)
+- `--cost` column may show $0 if the CLI does not report cost
+- To change Codex model: use `--codex-model` or set `RALPH_CODEX_MODEL`
 
 ## How It Works
 

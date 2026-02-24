@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ -n "${CODEX_ARGS_FILE:-}" ]; then
+  printf '%s\n' "$@" > "$CODEX_ARGS_FILE"
+fi
+
+if [ "${1:-}" = "exec" ] && printf '%s\n' "$@" | grep -q -- '--help'; then
+  cat <<'HELP'
+Usage: codex exec [options]
+  --json
+  --full-auto
+  --auto-edit
+  --suggest
+  -m MODEL
+HELP
+  exit 0
+fi
+
+if printf '%s\n' "$@" | grep -q -- '--json'; then
+  cat <<'JSONL'
+{"event":"message","message":{"content":"ok"}}
+{"final_output":"done"}
+JSONL
+else
+  echo "done"
+fi

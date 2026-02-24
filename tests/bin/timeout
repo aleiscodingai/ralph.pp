@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Minimal timeout stub for tests: just run the command.
+shift
+"$@"

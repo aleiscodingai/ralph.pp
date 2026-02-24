@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Minimal stub to satisfy command existence.
+# Output a JSON object if invoked with --output-format json.
+if printf '%s\n' "$@" | grep -q -- '--output-format'; then
+  cat <<'JSON'
+{"response":"ok","error":null,"stats":{"models":[{"tokens":{"prompt":0,"candidates":0,"cached":0}}]}}
+JSON
+else
+  echo "ok"
+fi
