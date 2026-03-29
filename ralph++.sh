@@ -160,8 +160,8 @@ fi
 # ── Claude Code adapter ──────────────────────────────────────────
 
 claude_convert_cmd() {
-  local prompt="$1"
-  timeout 600 claude --print --max-turns 10 --dangerously-skip-permissions -p "$prompt" 2>/dev/null
+  local in_file="$1" out_file="$2"
+  timeout 2400 claude --print --max-turns 10 --dangerously-skip-permissions -p "$(cat "$in_file")" > "$out_file"
 }
 
 claude_exec_cmd() {
@@ -194,8 +194,8 @@ claude_parse_response() {
 # ── Gemini CLI adapter ───────────────────────────────────────────
 
 gemini_convert_cmd() {
-  local prompt="$1"
-  timeout 120 gemini --yolo -p "$prompt" 2>/dev/null
+  local in_file="$1" out_file="$2"
+  timeout 120 gemini --yolo -p "$(cat "$in_file")" > "$out_file" 2>/dev/null
 }
 
 gemini_exec_cmd() {
@@ -259,7 +259,7 @@ codex_detect_capabilities() {
 }
 
 codex_convert_cmd() {
-  local prompt="$1"
+  local in_file="$1" out_file="$2"
   local mode_flag
   mode_flag=$(codex_mode_flag)
   [ "$mode_flag" = "INVALID" ] && echo "Invalid CODEX_MODE: $CODEX_MODE" && return 1
@@ -269,9 +269,9 @@ codex_convert_cmd() {
 
   codex_detect_capabilities
   if [ "$_CODEX_HAS_EXEC" = "1" ]; then
-    timeout 120 codex exec "$mode_flag" "${model_args[@]}" <<< "$prompt" 2>/dev/null
+    timeout 120 codex exec "$mode_flag" "${model_args[@]}" <<< "$(cat "$in_file")" > "$out_file" 2>/dev/null
   else
-    timeout 120 codex "$mode_flag" "${model_args[@]}" <<< "$prompt" 2>/dev/null
+    timeout 120 codex "$mode_flag" "${model_args[@]}" <<< "$(cat "$in_file")" > "$out_file" 2>/dev/null
   fi
 }
 
@@ -408,6 +408,30 @@ log_warn()  { echo -e "${YLW}${ICO_WARN}${RST} ${YLW}$*${RST}"; }
 log_err()   { echo -e "${RED}${ICO_FAIL}${RST} ${RED}$*${RST}"; }
 log_dim()   { echo -e "${GRY}  $*${RST}"; }
 
+# ── Spinner for long-running operations ──────────────────────────
+_spinner_pid=""
+start_spinner() {
+  local label="$1"
+  (
+    local elapsed=0
+    while true; do
+      printf "\r${GRY}  ${ICO_CLOCK} %s (%ds)${RST}  " "$label" "$elapsed"
+      sleep 5
+      elapsed=$((elapsed + 5))
+    done
+  ) &
+  _spinner_pid=$!
+}
+stop_spinner() {
+  if [ -n "$_spinner_pid" ]; then
+    kill "$_spinner_pid" 2>/dev/null || true
+    wait "$_spinner_pid" 2>/dev/null || true
+    _spinner_pid=""
+    printf "\r\033[K"  # clear the spinner line
+  fi
+}
+trap 'stop_spinner' EXIT
+
 # ── Convert .md PRD to JSON if needed ────────────────────────────
 RALPH_PROMPT_FILE="$HOME/.claude/commands/ralph.md"
 
@@ -442,11 +466,18 @@ if [[ "$PRD_FILE" == *.md ]]; then
 
     log_info "Converting markdown PRD to JSON..."
     log_dim "Source: $PRD_FILE"
+    log_dim "Engine: $ENGINE"
 
+    log_dim "Loading prompt and PRD source..."
     ralph_prompt=$(cat "$RALPH_PROMPT_FILE")
     md_content=$(cat "$PRD_FILE")
+    md_lines=$(echo "$md_content" | wc -l | tr -d ' ')
+    log_dim "PRD size: ${md_lines} lines"
 
-    convert_output=$(engine_convert_cmd "${ralph_prompt}
+    _convert_in=$(mktemp)
+    _convert_out=$(mktemp)
+    cat > "$_convert_in" <<CONVERT_EOF
+${ralph_prompt}
 
 ---
 
@@ -454,12 +485,24 @@ ${md_content}
 
 ---
 
-IMPORTANT: Output ONLY the raw prd.json content. No markdown fences, no explanation, just valid JSON.") || {
+IMPORTANT: Output ONLY the raw prd.json content. No markdown fences, no explanation, just valid JSON.
+CONVERT_EOF
+
+    log_info "Calling ${BOLD}$ENGINE${RST}${WHT} for conversion (timeout: 2400s)..."
+    start_spinner "Waiting for $ENGINE response"
+    engine_convert_cmd "$_convert_in" "$_convert_out" || {
+        stop_spinner
+        rm -f "$_convert_in" "$_convert_out"
         echo -e "${RED}${ICO_FAIL} Markdown-to-JSON conversion failed (exit $?)${RST}"
         exit 1
       }
+    stop_spinner
+    convert_output=$(cat "$_convert_out")
+    rm -f "$_convert_in" "$_convert_out"
+    log_ok "Response received from $ENGINE"
 
     # Extract JSON — best-effort brace match to handle fenced or verbose output
+    log_dim "Extracting JSON from response..."
     json_body=$(echo "$convert_output" | awk '
       BEGIN {c=0; start=0; out=""}
       {
@@ -475,11 +518,21 @@ IMPORTANT: Output ONLY the raw prd.json content. No markdown fences, no explanat
     ')
 
     # Validate the JSON has userStories
+    log_dim "Validating JSON structure..."
     if ! echo "$json_body" | jq -e '.userStories | length > 0' &>/dev/null; then
-      echo -e "${RED}${ICO_FAIL} Conversion produced invalid JSON (missing userStories)${RST}"
-      echo -e "${GRY}Raw output saved to: ${JSON_PRD}.failed${RST}"
-      echo "$convert_output" > "${JSON_PRD}.failed"
-      exit 1
+      # Fallback: Claude may have written prd.json to disk instead of stdout
+      _prd_dir=$(cd "$(dirname "$PRD_FILE")" && pwd)
+      _disk_prd="$_prd_dir/prd.json"
+      if [ -f "$_disk_prd" ] && jq -e '.userStories | length > 0' "$_disk_prd" &>/dev/null; then
+        log_warn "Engine wrote prd.json to disk instead of stdout — using that"
+        json_body=$(cat "$_disk_prd")
+        rm -f "$_disk_prd"
+      else
+        echo -e "${RED}${ICO_FAIL} Conversion produced invalid JSON (missing userStories)${RST}"
+        echo -e "${GRY}Raw output saved to: ${JSON_PRD}.failed${RST}"
+        echo "$convert_output" > "${JSON_PRD}.failed"
+        exit 1
+      fi
     fi
 
     echo "$json_body" | jq '.' > "$JSON_PRD"
