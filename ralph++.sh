@@ -48,7 +48,7 @@ ICO_TASK="◆"
 
 # ── Defaults ──────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PRD_FILE="$SCRIPT_DIR/prd.json"
+PRD_FILE="$(pwd)/prd.json"
 STATE_FILE=""
 LOG_DIR=""
 ARCHIVE_DIR=""
@@ -485,7 +485,7 @@ ${md_content}
 
 ---
 
-IMPORTANT: Output ONLY the raw prd.json content. No markdown fences, no explanation, just valid JSON.
+IMPORTANT: Do NOT use any tools. Do NOT write any files to disk. Output ONLY the raw prd.json content directly to stdout. No markdown fences, no explanation, no summary, just valid JSON.
 CONVERT_EOF
 
     log_info "Calling ${BOLD}$ENGINE${RST}${WHT} for conversion (timeout: 2400s)..."
@@ -863,6 +863,7 @@ run_task() {
   local last_attempt_diff="" last_raw_error="" pre_attempt_sha="" pre_attempt_clean="false"
 
   while (( attempt < max_att )); do
+    last_raw_error=""
     attempt=$((attempt + 1))
     local start_ts exit_code duration
     start_ts=$(date +%s)
